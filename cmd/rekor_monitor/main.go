@@ -143,7 +143,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		mainLoopV2(*once, *logInfoFile, *interval, rekorShards, activeShardOrigin)
+		mainLoopV2(tufClient, *once, *logInfoFile, *interval, rekorShards, activeShardOrigin, userAgent)
 		return
 	default:
 		log.Fatalf("Unsupported server version %v, only '1' and '2' are supported", rekorVersion)
@@ -258,7 +258,7 @@ func mainLoopV1(serverURL string, once bool, logInfoFile string, interval time.D
 	}
 }
 
-func mainLoopV2(once bool, logInfoFile string, interval time.Duration, rekorShards map[string]rekor_v2.ShardInfo, activeShardOrigin string) {
+func mainLoopV2(tufClient *tuf.Client, once bool, logInfoFile string, interval time.Duration, rekorShards map[string]rekor_v2.ShardInfo, activeShardOrigin string, userAgent string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -267,7 +267,33 @@ func mainLoopV2(once bool, logInfoFile string, interval time.Duration, rekorShar
 
 	// To get an immediate first tick, for-select is at the end of the loop
 	for {
-		_, err := rekor_v2.RunConsistencyCheck(context.Background(), rekorShards, activeShardOrigin, logInfoFile)
+		// On each iteration, we refresh the SigningConfig metadata and
+		// update the shards if we detect a change in the newest shard
+		signingConfig, err := rekor_v2.RefreshSigningConfig(tufClient)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error refreshing SigningConfig: %v", err)
+			return
+		}
+		shouldUpdate, err := rekor_v2.ShardsNeedUpdating(rekorShards, signingConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error refreshing shards: %v", err)
+			return
+		}
+		if shouldUpdate {
+			trustedRoot, err := root.GetTrustedRoot(tufClient)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error getting trusted root: %v", err)
+				return
+			}
+			rekorShards, activeShardOrigin, err = rekor_v2.GetRekorShards(context.Background(), trustedRoot, signingConfig.RekorLogURLs(), userAgent)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error getting shards: %v", err)
+				return
+			}
+		}
+
+		// Consistency check
+		_, err = rekor_v2.RunConsistencyCheck(context.Background(), rekorShards, activeShardOrigin, logInfoFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error running consistency check: %v", err)
 			return
